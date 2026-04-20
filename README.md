@@ -70,6 +70,16 @@ Example:
 ./run_fit_mano.sh --output-joint-format same --iterations 300
 ```
 
+## How to tell whether your output is 16 or 21 keypoints
+
+After each run, check the output JSON (`--output-json`, default `mano_fit_joints.json`):
+
+- `metadata.input_joint_count` tells you whether your input file had 16 or 21 joints.
+- `metadata.resolved_output_joint_format` tells you what the JSON output was written as (`16`, `21`, or `both`).
+- `joint_count` reports the exported joint count(s).
+
+Additionally, the CLI prints a `Joint summary:` line with input count, raw MANO model joint count, and JSON output format.
+
 ## Notes
 
 - If you see CUDA index/assert errors, run with `--device cpu` to avoid asynchronous CUDA kernel failures while debugging.

@@ -174,6 +174,7 @@ def fit_mano_to_joints(model: MANO, target_joints: torch.Tensor, iterations: int
         "hand_pose": hand_pose.detach(),
         "betas": betas.detach(),
         "transl": transl.detach(),
+        "model_output_joint_count_raw": int(final_output.joints.shape[1]),
         "joints21": joints21,
         "vertices": final_output.vertices[0].detach().cpu(),
     }
@@ -200,6 +201,12 @@ def build_output_joints(joints21: torch.Tensor, requested_format: str, input_joi
         }
 
     raise ValueError(f"Unexpected output format: {requested_format}")
+
+
+def resolve_output_joint_format(requested_format: str, input_joint_count: int) -> str:
+    if requested_format == "same":
+        return str(input_joint_count)
+    return requested_format
 
 
 def resolve_device(device_flag: str) -> torch.device:
@@ -240,7 +247,9 @@ def main() -> None:
     )
 
     write_obj(output_obj_path, result["vertices"], model.faces)
-    output_payload = build_output_joints(result["joints21"], args.output_joint_format, int(target_joints.shape[0]))
+    input_joint_count = int(target_joints.shape[0])
+    resolved_output_format = resolve_output_joint_format(args.output_joint_format, input_joint_count)
+    output_payload = build_output_joints(result["joints21"], args.output_joint_format, input_joint_count)
 
     output_payload["mano_params"] = {
         "global_orient": result["global_orient"][0].cpu().tolist(),
@@ -248,11 +257,24 @@ def main() -> None:
         "betas": result["betas"][0].cpu().tolist(),
         "transl": result["transl"][0].cpu().tolist(),
     }
+    output_payload["metadata"] = {
+        "input_joint_count": input_joint_count,
+        "requested_output_joint_format": args.output_joint_format,
+        "resolved_output_joint_format": resolved_output_format,
+        "model_output_joint_count_raw": result["model_output_joint_count_raw"],
+        "exported_obj_path": str(output_obj_path),
+    }
 
     with output_json_path.open("w", encoding="utf-8") as handle:
         json.dump(output_payload, handle, indent=2)
 
     print(f"Using device: {device}")
+    print(
+        "Joint summary: "
+        f"input={input_joint_count}, "
+        f"model_raw={result['model_output_joint_count_raw']}, "
+        f"json_output={resolved_output_format}"
+    )
     print(f"Saved fitted mesh OBJ to {output_obj_path}")
     print(f"Saved fitted keypoints JSON to {output_json_path}")
 

@@ -50,6 +50,25 @@ python fit_mano.py \
 - `--output-joint-format 21` → output only 21 joints
 - `--output-joint-format both` → output both joint sets
 
+## Quick start wrapper (auto-fills --input-json)
+
+If you don't want to pass `--input-json` every run, use:
+
+```bash
+./run_fit_mano.sh
+```
+
+This wrapper will:
+- auto-fill `--input-json sample_joints21.json` when missing
+- create `sample_joints21.json` if it does not exist
+- forward all other CLI flags to `fit_mano.py`
+
+Example:
+
+```bash
+./run_fit_mano.sh --output-joint-format same --iterations 300
+```
+
 ## Notes
 
 - The fitter optimizes MANO pose/shape parameters via gradient descent.

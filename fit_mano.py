@@ -11,9 +11,10 @@ from typing import Iterable
 import torch
 from smplx import MANO
 
-# MANO produces 21 joints by default: wrist + 4 joints per finger.
-# Some pipelines use a 16-joint representation without fingertips.
+# MANO 21-joint layout used by this script:
+# wrist + (thumb/index/middle/ring/pinky) * (mcp,pip,dip,tip)
 MANO16_FROM_21 = [0, 1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15, 17, 18, 19]
+MANO_FINGERTIP_VERTS = [744, 320, 443, 555, 672]  # thumb, index, middle, ring, pinky
 
 
 def parse_args() -> argparse.Namespace:
@@ -36,6 +37,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hand-side", choices=["left", "right"], default="right")
     parser.add_argument("--iterations", type=int, default=600, help="Optimization iterations.")
     parser.add_argument("--lr", type=float, default=0.03, help="Optimization learning rate.")
+    parser.add_argument(
+        "--device",
+        choices=["auto", "cpu", "cuda"],
+        default="auto",
+        help="Device for optimization (default: auto).",
+    )
     return parser.parse_args()
 
 
@@ -57,6 +64,8 @@ def read_joints(path: Path) -> torch.Tensor:
         raise ValueError(f"Expected input shape (N, 3); got {tuple(tensor.shape)}")
     if tensor.shape[0] not in (16, 21):
         raise ValueError(f"Expected 16 or 21 joints; got {tensor.shape[0]}")
+    if not torch.isfinite(tensor).all():
+        raise ValueError("Input joints contain NaN or Inf values.")
     return tensor
 
 
@@ -66,6 +75,40 @@ def write_obj(path: Path, vertices: torch.Tensor, faces: Iterable[Iterable[int]]
             handle.write(f"v {x:.8f} {y:.8f} {z:.8f}\n")
         for a, b, c in faces:
             handle.write(f"f {a + 1} {b + 1} {c + 1}\n")
+
+
+def joints16_to_21(joints16: torch.Tensor, vertices: torch.Tensor) -> torch.Tensor:
+    if joints16.shape[0] != 16:
+        raise ValueError(f"Expected 16 joints, got {joints16.shape[0]}")
+
+    max_tip = max(MANO_FINGERTIP_VERTS)
+    if vertices.shape[0] <= max_tip:
+        raise ValueError(
+            f"Cannot build 21 joints from 16: vertices has {vertices.shape[0]} rows, "
+            f"but fingertip vertex id {max_tip} is required."
+        )
+
+    joints21 = torch.zeros((21, 3), dtype=joints16.dtype, device=joints16.device)
+    joints21[MANO16_FROM_21] = joints16
+
+    # tip locations are sampled from mesh vertices.
+    for out_idx, tip_vert_idx in zip([4, 8, 12, 16, 20], MANO_FINGERTIP_VERTS):
+        joints21[out_idx] = vertices[tip_vert_idx]
+
+    return joints21
+
+
+def output_to_joints21(output_joints: torch.Tensor, output_vertices: torch.Tensor) -> torch.Tensor:
+    joint_count = int(output_joints.shape[0])
+
+    if joint_count >= 21:
+        return output_joints[:21]
+    if joint_count == 16:
+        return joints16_to_21(output_joints, output_vertices)
+
+    raise ValueError(
+        f"Unsupported MANO output joint count {joint_count}. Expected 16 or at least 21."
+    )
 
 
 def fit_mano_to_joints(model: MANO, target_joints: torch.Tensor, iterations: int, lr: float) -> dict[str, torch.Tensor]:
@@ -98,10 +141,15 @@ def fit_mano_to_joints(model: MANO, target_joints: torch.Tensor, iterations: int
             return_verts=True,
         )
 
-        predicted_all = output.joints[0]
+        predicted_all = output_to_joints21(output.joints[0], output.vertices[0])
         predicted_selected = predicted_all[selected_indices]
-
         predicted_centered = predicted_selected - predicted_selected[0:1]
+
+        if predicted_centered.shape != target_centered.shape:
+            raise RuntimeError(
+                f"Shape mismatch in loss: predicted {tuple(predicted_centered.shape)} vs "
+                f"target {tuple(target_centered.shape)}"
+            )
 
         data_loss = ((predicted_centered - target_centered) ** 2).mean()
         pose_reg = (hand_pose ** 2).mean() * 1e-4
@@ -119,12 +167,14 @@ def fit_mano_to_joints(model: MANO, target_joints: torch.Tensor, iterations: int
         return_verts=True,
     )
 
+    joints21 = output_to_joints21(final_output.joints[0], final_output.vertices[0]).detach().cpu()
+
     return {
         "global_orient": global_orient.detach(),
         "hand_pose": hand_pose.detach(),
         "betas": betas.detach(),
         "transl": transl.detach(),
-        "joints21": final_output.joints[0].detach().cpu(),
+        "joints21": joints21,
         "vertices": final_output.vertices[0].detach().cpu(),
     }
 
@@ -152,6 +202,18 @@ def build_output_joints(joints21: torch.Tensor, requested_format: str, input_joi
     raise ValueError(f"Unexpected output format: {requested_format}")
 
 
+def resolve_device(device_flag: str) -> torch.device:
+    if device_flag == "cpu":
+        return torch.device("cpu")
+    if device_flag == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("--device cuda requested, but CUDA is not available.")
+        return torch.device("cuda")
+
+    # auto
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
 def main() -> None:
     args = parse_args()
 
@@ -160,8 +222,8 @@ def main() -> None:
     output_json_path = Path(args.output_json)
 
     target_joints = read_joints(input_path)
+    device = resolve_device(args.device)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = MANO(
         model_path=args.mano_model_path,
         is_rhand=(args.hand_side == "right"),
@@ -190,6 +252,7 @@ def main() -> None:
     with output_json_path.open("w", encoding="utf-8") as handle:
         json.dump(output_payload, handle, indent=2)
 
+    print(f"Using device: {device}")
     print(f"Saved fitted mesh OBJ to {output_obj_path}")
     print(f"Saved fitted keypoints JSON to {output_json_path}")
 

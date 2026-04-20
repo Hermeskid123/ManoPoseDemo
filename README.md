@@ -40,7 +40,8 @@ python fit_mano.py \
   --mano-model-path ./mano/models \
   --output-obj fitted_hand.obj \
   --output-json fitted_hand.json \
-  --output-joint-format both
+  --output-joint-format both \
+  --device auto
 ```
 
 ### Output joint formats
@@ -71,6 +72,7 @@ Example:
 
 ## Notes
 
+- If you see CUDA index/assert errors, run with `--device cpu` to avoid asynchronous CUDA kernel failures while debugging.
 - The fitter optimizes MANO pose/shape parameters via gradient descent.
 - For 16-joint input, fingertip joints are omitted and recovered through fitting.
 - Output JSON also includes fitted MANO parameters (`global_orient`, `hand_pose`, `betas`, `transl`).

@@ -44,6 +44,17 @@ python fit_mano.py \
   --device auto
 ```
 
+### Strict MANO-16 experiment (no 21 tip generation)
+
+If you want to test with only 16 joints and avoid generating fingertip-based 21 joints:
+
+```bash
+python fit_mano.py \
+  --input-json input_16_joints.json \
+  --output-joint-format 16 \
+  --no-tip-augmentation
+```
+
 ### Output joint formats
 
 - `--output-joint-format same` → output matches input count
@@ -76,6 +87,7 @@ After each run, check the output JSON (`--output-json`, default `mano_fit_joints
 
 - `metadata.input_joint_count` tells you whether your input file had 16 or 21 joints.
 - `metadata.resolved_output_joint_format` tells you what the JSON output was written as (`16`, `21`, or `both`).
+- `metadata.tip_augmentation_enabled` tells you whether fingertip-based 16→21 augmentation was enabled.
 - `joint_count` reports the exported joint count(s).
 
 Additionally, the CLI prints a `Joint summary:` line with input count, raw MANO model joint count, and JSON output format.

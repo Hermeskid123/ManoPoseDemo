@@ -43,6 +43,14 @@ def parse_args() -> argparse.Namespace:
         default="auto",
         help="Device for optimization (default: auto).",
     )
+    parser.add_argument(
+        "--no-tip-augmentation",
+        action="store_true",
+        help=(
+            "Disable 16->21 fingertip augmentation. Useful for strict MANO-16 experiments. "
+            "When enabled, output formats that require 21 joints will fail if the model only returns 16."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -111,7 +119,22 @@ def output_to_joints21(output_joints: torch.Tensor, output_vertices: torch.Tenso
     )
 
 
-def fit_mano_to_joints(model: MANO, target_joints: torch.Tensor, iterations: int, lr: float) -> dict[str, torch.Tensor]:
+def output_to_joints16(output_joints: torch.Tensor) -> torch.Tensor:
+    joint_count = int(output_joints.shape[0])
+    if joint_count == 16:
+        return output_joints
+    if joint_count >= 21:
+        return output_joints[MANO16_FROM_21]
+    raise ValueError(f"Unsupported MANO output joint count {joint_count}. Expected 16 or at least 21.")
+
+
+def fit_mano_to_joints(
+    model: MANO,
+    target_joints: torch.Tensor,
+    iterations: int,
+    lr: float,
+    no_tip_augmentation: bool = False,
+) -> dict[str, torch.Tensor | int | None]:
     device = next(model.parameters()).device
     target_joints = target_joints.to(device=device)
 
@@ -122,11 +145,6 @@ def fit_mano_to_joints(model: MANO, target_joints: torch.Tensor, iterations: int
     transl = torch.nn.Parameter(torch.zeros(1, 3, device=device))
 
     optimizer = torch.optim.Adam([global_orient, hand_pose, betas, transl], lr=lr)
-
-    if target_joints.shape[0] == 16:
-        selected_indices = MANO16_FROM_21
-    else:
-        selected_indices = list(range(21))
 
     target_centered = target_joints - target_joints[0:1]
 
@@ -141,8 +159,12 @@ def fit_mano_to_joints(model: MANO, target_joints: torch.Tensor, iterations: int
             return_verts=True,
         )
 
-        predicted_all = output_to_joints21(output.joints[0], output.vertices[0])
-        predicted_selected = predicted_all[selected_indices]
+        if target_joints.shape[0] == 16 and no_tip_augmentation:
+            predicted_selected = output_to_joints16(output.joints[0])
+        elif target_joints.shape[0] == 16:
+            predicted_selected = output_to_joints21(output.joints[0], output.vertices[0])[MANO16_FROM_21]
+        else:
+            predicted_selected = output_to_joints21(output.joints[0], output.vertices[0])
         predicted_centered = predicted_selected - predicted_selected[0:1]
 
         if predicted_centered.shape != target_centered.shape:
@@ -167,7 +189,13 @@ def fit_mano_to_joints(model: MANO, target_joints: torch.Tensor, iterations: int
         return_verts=True,
     )
 
-    joints21 = output_to_joints21(final_output.joints[0], final_output.vertices[0]).detach().cpu()
+    joints21: torch.Tensor | None
+    if int(final_output.joints.shape[1]) >= 21:
+        joints21 = output_to_joints21(final_output.joints[0], final_output.vertices[0]).detach().cpu()
+    elif no_tip_augmentation:
+        joints21 = None
+    else:
+        joints21 = output_to_joints21(final_output.joints[0], final_output.vertices[0]).detach().cpu()
 
     return {
         "global_orient": global_orient.detach(),
@@ -175,13 +203,18 @@ def fit_mano_to_joints(model: MANO, target_joints: torch.Tensor, iterations: int
         "betas": betas.detach(),
         "transl": transl.detach(),
         "model_output_joint_count_raw": int(final_output.joints.shape[1]),
+        "joints16": output_to_joints16(final_output.joints[0]).detach().cpu(),
         "joints21": joints21,
         "vertices": final_output.vertices[0].detach().cpu(),
     }
 
 
-def build_output_joints(joints21: torch.Tensor, requested_format: str, input_joint_count: int) -> dict[str, list[list[float]]]:
-    joints16 = joints21[MANO16_FROM_21]
+def build_output_joints(
+    joints16: torch.Tensor,
+    joints21: torch.Tensor | None,
+    requested_format: str,
+    input_joint_count: int,
+) -> dict[str, list[list[float]] | int | dict[str, int]]:
 
     def to_list(tensor: torch.Tensor) -> list[list[float]]:
         return tensor.tolist()
@@ -190,10 +223,20 @@ def build_output_joints(joints21: torch.Tensor, requested_format: str, input_joi
         requested_format = str(input_joint_count)
 
     if requested_format == "21":
+        if joints21 is None:
+            raise ValueError(
+                "21-joint output requested but unavailable because --no-tip-augmentation was set "
+                "and the loaded MANO returned only 16 joints."
+            )
         return {"joints": to_list(joints21), "joint_count": 21}
     if requested_format == "16":
         return {"joints": to_list(joints16), "joint_count": 16}
     if requested_format == "both":
+        if joints21 is None:
+            raise ValueError(
+                "'both' output requested but 21 joints are unavailable because --no-tip-augmentation "
+                "was set and the loaded MANO returned only 16 joints."
+            )
         return {
             "joints21": to_list(joints21),
             "joints16": to_list(joints16),
@@ -244,12 +287,18 @@ def main() -> None:
         target_joints=target_joints,
         iterations=args.iterations,
         lr=args.lr,
+        no_tip_augmentation=args.no_tip_augmentation,
     )
 
     write_obj(output_obj_path, result["vertices"], model.faces)
     input_joint_count = int(target_joints.shape[0])
     resolved_output_format = resolve_output_joint_format(args.output_joint_format, input_joint_count)
-    output_payload = build_output_joints(result["joints21"], args.output_joint_format, input_joint_count)
+    output_payload = build_output_joints(
+        joints16=result["joints16"],
+        joints21=result["joints21"],
+        requested_format=args.output_joint_format,
+        input_joint_count=input_joint_count,
+    )
 
     output_payload["mano_params"] = {
         "global_orient": result["global_orient"][0].cpu().tolist(),
@@ -262,6 +311,7 @@ def main() -> None:
         "requested_output_joint_format": args.output_joint_format,
         "resolved_output_joint_format": resolved_output_format,
         "model_output_joint_count_raw": result["model_output_joint_count_raw"],
+        "tip_augmentation_enabled": not args.no_tip_augmentation,
         "exported_obj_path": str(output_obj_path),
     }
 

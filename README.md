@@ -4,7 +4,8 @@ This project now focuses on fitting a MANO hand model from **either 16 or 21 3D 
 
 - `.obj` mesh
 - `.json` keypoints (16, 21, same as input, or both)
-- optional depth image (`.png`) rasterized from the fitted mesh
+- optional grayscale depth image (`.png` path, PGM data) rasterized from the fitted mesh
+- RGB color-coded depth image (`.png`) using white → red → green → blue mapping
 
 ## Requirements
 
@@ -64,11 +65,14 @@ A depth map is exported by default to `mano_fit_depth.png`. You can override it 
 python fit_mano.py \
   --input-json input_joints.json \
   --output-depth-png fitted_depth.png \
-  --depth-size 512
+  --depth-size 512 \
+  --output-depth-rgb-png fitted_depth_rgb.png
 ```
 
 - `--output-depth-png` sets the depth output filename/path (default: `mano_fit_depth.png`).
 - `--depth-size` controls output resolution (square image).
+- `--output-depth-rgb-png` sets RGB color depth output path (default: `mano_fit_depth_rgb.png`).
+- `--depth-max-limit` optionally clamps far depth values before color coding.
 
 ### Output joint formats
 

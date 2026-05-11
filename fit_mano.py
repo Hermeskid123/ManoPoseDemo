@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Iterable
 
 import torch
+import numpy as np
 from smplx import MANO
 
 # MANO 21-joint layout used by this script:
@@ -28,6 +29,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mano-model-path", default="./mano/models", help="Path to MANO models directory.")
     parser.add_argument("--output-obj", default="mano_fit.obj", help="Output OBJ mesh path.")
     parser.add_argument("--output-json", default="mano_fit_joints.json", help="Output keypoints JSON path.")
+    parser.add_argument(
+        "--output-depth-png",
+        default=None,
+        help="Optional output depth image (.png). When set, a depth map is rasterized from the fitted mesh.",
+    )
+    parser.add_argument("--depth-size", type=int, default=512, help="Depth image size in pixels (square).")
     parser.add_argument(
         "--output-joint-format",
         choices=["same", "16", "21", "both"],
@@ -83,6 +90,74 @@ def write_obj(path: Path, vertices: torch.Tensor, faces: Iterable[Iterable[int]]
             handle.write(f"v {x:.8f} {y:.8f} {z:.8f}\n")
         for a, b, c in faces:
             handle.write(f"f {a + 1} {b + 1} {c + 1}\n")
+
+
+def write_depth_png(path: Path, vertices: torch.Tensor, faces: Iterable[Iterable[int]], size: int = 512) -> None:
+    if size <= 0:
+        raise ValueError(f"Depth image size must be positive, got {size}.")
+
+    verts = vertices.detach().cpu().numpy().astype(np.float32)
+    tris = np.asarray(list(faces), dtype=np.int32)
+
+    xy = verts[:, :2]
+    z = verts[:, 2]
+
+    xy_min = xy.min(axis=0)
+    xy_max = xy.max(axis=0)
+    span = np.maximum(xy_max - xy_min, 1e-8)
+    scale = (size - 1) / float(np.max(span))
+    xy_pix = (xy - xy_min) * scale
+    pad_x = (size - 1 - (xy_max[0] - xy_min[0]) * scale) * 0.5
+    pad_y = (size - 1 - (xy_max[1] - xy_min[1]) * scale) * 0.5
+    xy_pix[:, 0] += pad_x
+    xy_pix[:, 1] += pad_y
+    xy_pix[:, 1] = (size - 1) - xy_pix[:, 1]
+
+    zbuf = np.full((size, size), np.inf, dtype=np.float32)
+
+    for i0, i1, i2 in tris:
+        p0, p1, p2 = xy_pix[i0], xy_pix[i1], xy_pix[i2]
+        z0, z1, z2 = z[i0], z[i1], z[i2]
+
+        min_x = max(int(np.floor(min(p0[0], p1[0], p2[0]))), 0)
+        max_x = min(int(np.ceil(max(p0[0], p1[0], p2[0]))), size - 1)
+        min_y = max(int(np.floor(min(p0[1], p1[1], p2[1]))), 0)
+        max_y = min(int(np.ceil(max(p0[1], p1[1], p2[1]))), size - 1)
+        if min_x > max_x or min_y > max_y:
+            continue
+
+        area = (p1[0] - p0[0]) * (p2[1] - p0[1]) - (p1[1] - p0[1]) * (p2[0] - p0[0])
+        if abs(area) < 1e-8:
+            continue
+
+        for yy in range(min_y, max_y + 1):
+            for xx in range(min_x, max_x + 1):
+                px = xx + 0.5
+                py = yy + 0.5
+
+                w0 = ((p1[0] - px) * (p2[1] - py) - (p1[1] - py) * (p2[0] - px)) / area
+                w1 = ((p2[0] - px) * (p0[1] - py) - (p2[1] - py) * (p0[0] - px)) / area
+                w2 = 1.0 - w0 - w1
+
+                if w0 < 0 or w1 < 0 or w2 < 0:
+                    continue
+
+                depth = w0 * z0 + w1 * z1 + w2 * z2
+                if depth < zbuf[yy, xx]:
+                    zbuf[yy, xx] = depth
+
+    mask = np.isfinite(zbuf)
+    depth_u8 = np.zeros((size, size), dtype=np.uint8)
+    if np.any(mask):
+        valid = zbuf[mask]
+        z_min, z_max = float(valid.min()), float(valid.max())
+        denom = max(z_max - z_min, 1e-8)
+        norm = (valid - z_min) / denom
+        depth_u8[mask] = np.clip((1.0 - norm) * 255.0, 0, 255).astype(np.uint8)
+
+    with path.open("wb") as handle:
+        handle.write(f"P5\n{size} {size}\n255\n".encode("ascii"))
+        handle.write(depth_u8.tobytes())
 
 
 def joints16_to_21(joints16: torch.Tensor, vertices: torch.Tensor) -> torch.Tensor:
@@ -291,6 +366,9 @@ def main() -> None:
     )
 
     write_obj(output_obj_path, result["vertices"], model.faces)
+    depth_png_path = Path(args.output_depth_png) if args.output_depth_png else None
+    if depth_png_path is not None:
+        write_depth_png(depth_png_path, result["vertices"], model.faces, size=args.depth_size)
     input_joint_count = int(target_joints.shape[0])
     resolved_output_format = resolve_output_joint_format(args.output_joint_format, input_joint_count)
     output_payload = build_output_joints(
@@ -313,6 +391,7 @@ def main() -> None:
         "model_output_joint_count_raw": result["model_output_joint_count_raw"],
         "tip_augmentation_enabled": not args.no_tip_augmentation,
         "exported_obj_path": str(output_obj_path),
+        "exported_depth_png_path": str(depth_png_path) if depth_png_path is not None else None,
     }
 
     with output_json_path.open("w", encoding="utf-8") as handle:
@@ -326,6 +405,8 @@ def main() -> None:
         f"json_output={resolved_output_format}"
     )
     print(f"Saved fitted mesh OBJ to {output_obj_path}")
+    if depth_png_path is not None:
+        print(f"Saved fitted depth image to {depth_png_path}")
     print(f"Saved fitted keypoints JSON to {output_json_path}")
 
 

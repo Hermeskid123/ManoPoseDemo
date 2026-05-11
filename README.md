@@ -4,6 +4,7 @@ This project now focuses on fitting a MANO hand model from **either 16 or 21 3D 
 
 - `.obj` mesh
 - `.json` keypoints (16, 21, same as input, or both)
+- optional depth image (`.png`) rasterized from the fitted mesh
 
 ## Requirements
 
@@ -54,6 +55,20 @@ python fit_mano.py \
   --output-joint-format 16 \
   --no-tip-augmentation
 ```
+
+### Optional depth image export
+
+Add `--output-depth-png` to export a depth map rendered from the fitted MANO mesh:
+
+```bash
+python fit_mano.py \
+  --input-json input_joints.json \
+  --output-depth-png fitted_depth.png \
+  --depth-size 512
+```
+
+- `--output-depth-png` enables depth export (disabled by default).
+- `--depth-size` controls output resolution (square image).
 
 ### Output joint formats
 

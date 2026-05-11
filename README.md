@@ -4,7 +4,7 @@ This project now focuses on fitting a MANO hand model from **either 16 or 21 3D 
 
 - `.obj` mesh
 - `.json` keypoints (16, 21, same as input, or both)
-- optional grayscale depth image (`.png` path, PGM data) rasterized from the fitted mesh
+- grayscale depth image (`.png`) rasterized from the fitted mesh
 - RGB color-coded depth image (`.png`) using white → red → green → blue mapping
 
 ## Requirements

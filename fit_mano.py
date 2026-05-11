@@ -171,9 +171,7 @@ def write_depth_png(path: Path, vertices: torch.Tensor, faces: Iterable[Iterable
         norm = (valid - z_min) / denom
         depth_u8[mask] = np.clip((1.0 - norm) * 255.0, 0, 255).astype(np.uint8)
 
-    with path.open("wb") as handle:
-        handle.write(f"P5\n{size} {size}\n255\n".encode("ascii"))
-        handle.write(depth_u8.tobytes())
+    write_gray_png(path, depth_u8)
 
 
 def color_code3(depth_image: np.ndarray, max_limit: float | None = None) -> np.ndarray:
@@ -293,6 +291,31 @@ def write_rgb_png(path: Path, rgb: np.ndarray) -> None:
         )
 
     ihdr = struct.pack("!IIBBBBB", width, height, 8, 2, 0, 0, 0)  # RGB
+    png_bytes = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", compressed) + chunk(b"IEND", b"")
+    path.write_bytes(png_bytes)
+
+
+def write_gray_png(path: Path, gray: np.ndarray) -> None:
+    if gray.ndim != 2 or gray.dtype != np.uint8:
+        raise ValueError("Expected grayscale array with shape (H, W) and dtype uint8.")
+
+    height, width = gray.shape
+    raw = bytearray()
+    for row in gray:
+        raw.append(0)  # filter type 0 (None)
+        raw.extend(row.tobytes())
+
+    compressed = zlib.compress(bytes(raw), level=9)
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack("!I", len(data))
+            + tag
+            + data
+            + struct.pack("!I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        )
+
+    ihdr = struct.pack("!IIBBBBB", width, height, 8, 0, 0, 0, 0)  # grayscale
     png_bytes = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", compressed) + chunk(b"IEND", b"")
     path.write_bytes(png_bytes)
 

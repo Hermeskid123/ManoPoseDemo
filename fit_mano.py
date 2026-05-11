@@ -5,10 +5,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import struct
+import zlib
 from pathlib import Path
 from typing import Iterable
 
 import torch
+import numpy as np
 from smplx import MANO
 
 # MANO 21-joint layout used by this script:
@@ -28,6 +31,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mano-model-path", default="./mano/models", help="Path to MANO models directory.")
     parser.add_argument("--output-obj", default="mano_fit.obj", help="Output OBJ mesh path.")
     parser.add_argument("--output-json", default="mano_fit_joints.json", help="Output keypoints JSON path.")
+    parser.add_argument(
+        "--output-depth-png",
+        default="mano_fit_depth.png",
+        help=(
+            "Output depth image path (.png). "
+            "Depth export is enabled by default and rasterized from the fitted mesh."
+        ),
+    )
+    parser.add_argument("--depth-size", type=int, default=512, help="Depth image size in pixels (square).")
+    parser.add_argument(
+        "--output-depth-rgb-png",
+        default="mano_fit_depth_rgb.png",
+        help="Output RGB color-coded depth image path (.png).",
+    )
+    parser.add_argument(
+        "--depth-max-limit",
+        type=float,
+        default=None,
+        help="Optional max depth clamp used by RGB depth color-coding (values above are treated as background).",
+    )
     parser.add_argument(
         "--output-joint-format",
         choices=["same", "16", "21", "both"],
@@ -83,6 +106,218 @@ def write_obj(path: Path, vertices: torch.Tensor, faces: Iterable[Iterable[int]]
             handle.write(f"v {x:.8f} {y:.8f} {z:.8f}\n")
         for a, b, c in faces:
             handle.write(f"f {a + 1} {b + 1} {c + 1}\n")
+
+
+def write_depth_png(path: Path, vertices: torch.Tensor, faces: Iterable[Iterable[int]], size: int = 512) -> None:
+    if size <= 0:
+        raise ValueError(f"Depth image size must be positive, got {size}.")
+
+    verts = vertices.detach().cpu().numpy().astype(np.float32)
+    tris = np.asarray(list(faces), dtype=np.int32)
+
+    xy = verts[:, :2]
+    z = verts[:, 2]
+
+    xy_min = xy.min(axis=0)
+    xy_max = xy.max(axis=0)
+    span = np.maximum(xy_max - xy_min, 1e-8)
+    scale = (size - 1) / float(np.max(span))
+    xy_pix = (xy - xy_min) * scale
+    pad_x = (size - 1 - (xy_max[0] - xy_min[0]) * scale) * 0.5
+    pad_y = (size - 1 - (xy_max[1] - xy_min[1]) * scale) * 0.5
+    xy_pix[:, 0] += pad_x
+    xy_pix[:, 1] += pad_y
+    xy_pix[:, 1] = (size - 1) - xy_pix[:, 1]
+
+    zbuf = np.full((size, size), np.inf, dtype=np.float32)
+
+    for i0, i1, i2 in tris:
+        p0, p1, p2 = xy_pix[i0], xy_pix[i1], xy_pix[i2]
+        z0, z1, z2 = z[i0], z[i1], z[i2]
+
+        min_x = max(int(np.floor(min(p0[0], p1[0], p2[0]))), 0)
+        max_x = min(int(np.ceil(max(p0[0], p1[0], p2[0]))), size - 1)
+        min_y = max(int(np.floor(min(p0[1], p1[1], p2[1]))), 0)
+        max_y = min(int(np.ceil(max(p0[1], p1[1], p2[1]))), size - 1)
+        if min_x > max_x or min_y > max_y:
+            continue
+
+        area = (p1[0] - p0[0]) * (p2[1] - p0[1]) - (p1[1] - p0[1]) * (p2[0] - p0[0])
+        if abs(area) < 1e-8:
+            continue
+
+        for yy in range(min_y, max_y + 1):
+            for xx in range(min_x, max_x + 1):
+                px = xx + 0.5
+                py = yy + 0.5
+
+                w0 = ((p1[0] - px) * (p2[1] - py) - (p1[1] - py) * (p2[0] - px)) / area
+                w1 = ((p2[0] - px) * (p0[1] - py) - (p2[1] - py) * (p0[0] - px)) / area
+                w2 = 1.0 - w0 - w1
+
+                if w0 < 0 or w1 < 0 or w2 < 0:
+                    continue
+
+                depth = w0 * z0 + w1 * z1 + w2 * z2
+                if depth < zbuf[yy, xx]:
+                    zbuf[yy, xx] = depth
+
+    mask = np.isfinite(zbuf)
+    depth_u8 = np.zeros((size, size), dtype=np.uint8)
+    if np.any(mask):
+        valid = zbuf[mask]
+        z_min, z_max = float(valid.min()), float(valid.max())
+        denom = max(z_max - z_min, 1e-8)
+        norm = (valid - z_min) / denom
+        depth_u8[mask] = np.clip((1.0 - norm) * 255.0, 0, 255).astype(np.uint8)
+
+    write_gray_png(path, depth_u8)
+
+
+def color_code3(depth_image: np.ndarray, max_limit: float | None = None) -> np.ndarray:
+    depth_data = depth_image.astype(np.float64).copy()
+    if max_limit is not None:
+        depth_data[depth_data > max_limit] = 0
+
+    nonzero = depth_data > 0
+    if not np.any(nonzero):
+        return np.zeros((depth_data.shape[0], depth_data.shape[1], 3), dtype=np.uint8)
+
+    nonzero_values = depth_data[nonzero]
+    minimum = nonzero_values.min()
+    maximum = nonzero_values.max()
+    nonzero_values = nonzero_values - minimum + 1
+    nonzero_values = nonzero_values * (765.0 / (maximum - minimum + 1.0))
+    nonzero_values = np.round(nonzero_values)
+    depth_data[nonzero] = nonzero_values
+
+    red = np.zeros_like(depth_data, dtype=np.uint8)
+    green = np.zeros_like(depth_data, dtype=np.uint8)
+    blue = np.zeros_like(depth_data, dtype=np.uint8)
+
+    selected = (depth_data > 0) & (depth_data <= 255)
+    red[selected] = 255
+    green[selected] = np.clip(255 - depth_data[selected], 0, 255).astype(np.uint8)
+    blue[selected] = np.clip(255 - depth_data[selected], 0, 255).astype(np.uint8)
+
+    selected = (depth_data > 255) & (depth_data <= 510)
+    red[selected] = np.clip(510 - depth_data[selected], 0, 255).astype(np.uint8)
+    green[selected] = np.clip(depth_data[selected] - 255, 0, 255).astype(np.uint8)
+    blue[selected] = 0
+
+    selected = (depth_data > 510) & (depth_data <= 765)
+    red[selected] = 0
+    green[selected] = np.clip(765 - depth_data[selected], 0, 255).astype(np.uint8)
+    blue[selected] = np.clip(depth_data[selected] - 510, 0, 255).astype(np.uint8)
+
+    return np.stack([red, green, blue], axis=-1)
+
+
+def write_depth_rgb_png(
+    path: Path,
+    vertices: torch.Tensor,
+    faces: Iterable[Iterable[int]],
+    size: int = 512,
+    max_limit: float | None = None,
+) -> None:
+    verts = vertices.detach().cpu().numpy().astype(np.float32)
+    tris = np.asarray(list(faces), dtype=np.int32)
+
+    xy = verts[:, :2]
+    z = verts[:, 2]
+
+    xy_min = xy.min(axis=0)
+    xy_max = xy.max(axis=0)
+    span = np.maximum(xy_max - xy_min, 1e-8)
+    scale = (size - 1) / float(np.max(span))
+    xy_pix = (xy - xy_min) * scale
+    pad_x = (size - 1 - (xy_max[0] - xy_min[0]) * scale) * 0.5
+    pad_y = (size - 1 - (xy_max[1] - xy_min[1]) * scale) * 0.5
+    xy_pix[:, 0] += pad_x
+    xy_pix[:, 1] += pad_y
+    xy_pix[:, 1] = (size - 1) - xy_pix[:, 1]
+
+    zbuf = np.zeros((size, size), dtype=np.float32)
+    best = np.full((size, size), np.inf, dtype=np.float32)
+
+    for i0, i1, i2 in tris:
+        p0, p1, p2 = xy_pix[i0], xy_pix[i1], xy_pix[i2]
+        z0, z1, z2 = z[i0], z[i1], z[i2]
+        min_x = max(int(np.floor(min(p0[0], p1[0], p2[0]))), 0)
+        max_x = min(int(np.ceil(max(p0[0], p1[0], p2[0]))), size - 1)
+        min_y = max(int(np.floor(min(p0[1], p1[1], p2[1]))), 0)
+        max_y = min(int(np.ceil(max(p0[1], p1[1], p2[1]))), size - 1)
+        if min_x > max_x or min_y > max_y:
+            continue
+        area = (p1[0] - p0[0]) * (p2[1] - p0[1]) - (p1[1] - p0[1]) * (p2[0] - p0[0])
+        if abs(area) < 1e-8:
+            continue
+        for yy in range(min_y, max_y + 1):
+            for xx in range(min_x, max_x + 1):
+                px = xx + 0.5
+                py = yy + 0.5
+                w0 = ((p1[0] - px) * (p2[1] - py) - (p1[1] - py) * (p2[0] - px)) / area
+                w1 = ((p2[0] - px) * (p0[1] - py) - (p2[1] - py) * (p0[0] - px)) / area
+                w2 = 1.0 - w0 - w1
+                if w0 < 0 or w1 < 0 or w2 < 0:
+                    continue
+                depth = w0 * z0 + w1 * z1 + w2 * z2
+                if depth < best[yy, xx]:
+                    best[yy, xx] = depth
+                    zbuf[yy, xx] = depth
+
+    color = color_code3(zbuf, max_limit=max_limit)
+    write_rgb_png(path, color)
+
+
+def write_rgb_png(path: Path, rgb: np.ndarray) -> None:
+    if rgb.ndim != 3 or rgb.shape[2] != 3 or rgb.dtype != np.uint8:
+        raise ValueError("Expected RGB array with shape (H, W, 3) and dtype uint8.")
+
+    height, width, _ = rgb.shape
+    raw = bytearray()
+    for row in rgb:
+        raw.append(0)  # filter type 0 (None)
+        raw.extend(row.tobytes())
+
+    compressed = zlib.compress(bytes(raw), level=9)
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack("!I", len(data))
+            + tag
+            + data
+            + struct.pack("!I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        )
+
+    ihdr = struct.pack("!IIBBBBB", width, height, 8, 2, 0, 0, 0)  # RGB
+    png_bytes = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", compressed) + chunk(b"IEND", b"")
+    path.write_bytes(png_bytes)
+
+
+def write_gray_png(path: Path, gray: np.ndarray) -> None:
+    if gray.ndim != 2 or gray.dtype != np.uint8:
+        raise ValueError("Expected grayscale array with shape (H, W) and dtype uint8.")
+
+    height, width = gray.shape
+    raw = bytearray()
+    for row in gray:
+        raw.append(0)  # filter type 0 (None)
+        raw.extend(row.tobytes())
+
+    compressed = zlib.compress(bytes(raw), level=9)
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return (
+            struct.pack("!I", len(data))
+            + tag
+            + data
+            + struct.pack("!I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        )
+
+    ihdr = struct.pack("!IIBBBBB", width, height, 8, 0, 0, 0, 0)  # grayscale
+    png_bytes = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", compressed) + chunk(b"IEND", b"")
+    path.write_bytes(png_bytes)
 
 
 def joints16_to_21(joints16: torch.Tensor, vertices: torch.Tensor) -> torch.Tensor:
@@ -291,6 +526,16 @@ def main() -> None:
     )
 
     write_obj(output_obj_path, result["vertices"], model.faces)
+    depth_png_path = Path(args.output_depth_png)
+    depth_rgb_png_path = Path(args.output_depth_rgb_png)
+    write_depth_png(depth_png_path, result["vertices"], model.faces, size=args.depth_size)
+    write_depth_rgb_png(
+        depth_rgb_png_path,
+        result["vertices"],
+        model.faces,
+        size=args.depth_size,
+        max_limit=args.depth_max_limit,
+    )
     input_joint_count = int(target_joints.shape[0])
     resolved_output_format = resolve_output_joint_format(args.output_joint_format, input_joint_count)
     output_payload = build_output_joints(
@@ -313,6 +558,8 @@ def main() -> None:
         "model_output_joint_count_raw": result["model_output_joint_count_raw"],
         "tip_augmentation_enabled": not args.no_tip_augmentation,
         "exported_obj_path": str(output_obj_path),
+        "exported_depth_png_path": str(depth_png_path),
+        "exported_depth_rgb_png_path": str(depth_rgb_png_path),
     }
 
     with output_json_path.open("w", encoding="utf-8") as handle:
@@ -326,6 +573,8 @@ def main() -> None:
         f"json_output={resolved_output_format}"
     )
     print(f"Saved fitted mesh OBJ to {output_obj_path}")
+    print(f"Saved fitted depth image to {depth_png_path}")
+    print(f"Saved fitted RGB depth image to {depth_rgb_png_path}")
     print(f"Saved fitted keypoints JSON to {output_json_path}")
 
 

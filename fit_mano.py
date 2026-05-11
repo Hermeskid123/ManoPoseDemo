@@ -31,8 +31,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-json", default="mano_fit_joints.json", help="Output keypoints JSON path.")
     parser.add_argument(
         "--output-depth-png",
-        default=None,
-        help="Optional output depth image (.png). When set, a depth map is rasterized from the fitted mesh.",
+        default="mano_fit_depth.png",
+        help=(
+            "Output depth image path (.png). "
+            "Depth export is enabled by default and rasterized from the fitted mesh."
+        ),
     )
     parser.add_argument("--depth-size", type=int, default=512, help="Depth image size in pixels (square).")
     parser.add_argument(
@@ -366,9 +369,8 @@ def main() -> None:
     )
 
     write_obj(output_obj_path, result["vertices"], model.faces)
-    depth_png_path = Path(args.output_depth_png) if args.output_depth_png else None
-    if depth_png_path is not None:
-        write_depth_png(depth_png_path, result["vertices"], model.faces, size=args.depth_size)
+    depth_png_path = Path(args.output_depth_png)
+    write_depth_png(depth_png_path, result["vertices"], model.faces, size=args.depth_size)
     input_joint_count = int(target_joints.shape[0])
     resolved_output_format = resolve_output_joint_format(args.output_joint_format, input_joint_count)
     output_payload = build_output_joints(
@@ -391,7 +393,7 @@ def main() -> None:
         "model_output_joint_count_raw": result["model_output_joint_count_raw"],
         "tip_augmentation_enabled": not args.no_tip_augmentation,
         "exported_obj_path": str(output_obj_path),
-        "exported_depth_png_path": str(depth_png_path) if depth_png_path is not None else None,
+        "exported_depth_png_path": str(depth_png_path),
     }
 
     with output_json_path.open("w", encoding="utf-8") as handle:
@@ -405,8 +407,7 @@ def main() -> None:
         f"json_output={resolved_output_format}"
     )
     print(f"Saved fitted mesh OBJ to {output_obj_path}")
-    if depth_png_path is not None:
-        print(f"Saved fitted depth image to {depth_png_path}")
+    print(f"Saved fitted depth image to {depth_png_path}")
     print(f"Saved fitted keypoints JSON to {output_json_path}")
 
 

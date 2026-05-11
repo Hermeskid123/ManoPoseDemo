@@ -56,9 +56,9 @@ python fit_mano.py \
   --no-tip-augmentation
 ```
 
-### Optional depth image export
+### Depth image export (enabled by default)
 
-Add `--output-depth-png` to export a depth map rendered from the fitted MANO mesh:
+A depth map is exported by default to `mano_fit_depth.png`. You can override it with `--output-depth-png`:
 
 ```bash
 python fit_mano.py \
@@ -67,7 +67,7 @@ python fit_mano.py \
   --depth-size 512
 ```
 
-- `--output-depth-png` enables depth export (disabled by default).
+- `--output-depth-png` sets the depth output filename/path (default: `mano_fit_depth.png`).
 - `--depth-size` controls output resolution (square image).
 
 ### Output joint formats

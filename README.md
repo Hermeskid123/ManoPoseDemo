@@ -117,3 +117,20 @@ Additionally, the CLI prints a `Joint summary:` line with input count, raw MANO 
 - The fitter optimizes MANO pose/shape parameters via gradient descent.
 - For 16-joint input, fingertip joints are omitted and recovered through fitting.
 - Output JSON also includes fitted MANO parameters (`global_orient`, `hand_pose`, `betas`, `transl`).
+
+## OBJ → Point Cloud Graph helper
+
+Use `obj_to_pointcloud_graph.py` to convert an OBJ hand mesh into a point-cloud graph (k-NN):
+
+```bash
+python obj_to_pointcloud_graph.py random_mano_hand.obj \
+  --output-prefix random_mano_hand \
+  --k 8 \
+  --plot
+```
+
+Outputs:
+- `*_points.npy` (Nx3 point cloud)
+- `*_edges.npy` (Ex2 undirected edge list)
+- `*_graph.npz` (combined points + edges + metadata)
+- optional `*_graph.png` visualization when `--plot` is set.
